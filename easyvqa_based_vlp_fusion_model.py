@@ -123,8 +123,8 @@ class EarlyFusionNetwork(nn.Module):
         Xvt = Xv * Xt #fusion step
         Xvt = self.relu_f(torch.mm(Xvt, self.W.t()))
 
-        Xvt = self.fc1(Xvt)
-        Xvt = self.bn1(Xvt)
+        Xvt = self.fully_connected_layer1(Xvt)
+        Xvt = self.batch_normalization_layer1(Xvt)
         Xvt = self.dropout(Xvt)
         Xvt = self.classifier(Xvt)
 
