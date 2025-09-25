@@ -11,10 +11,15 @@ They are a foundational step in multimodal AI, designed to understand and relate
 !pip install -qqq easy-vqa
 !pip install -qqq sentence_transformers transformers timm
 
+from google.colab import drive
+drive.mount('/content/drive', force_remount=True)
+
+import os
 import math
 import random
 import numpy as np
 import pandas as pd
+from matplotlib import pyplot as plt
 from easy_vqa import get_train_questions, get_test_questions, get_answers
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
@@ -27,7 +32,9 @@ from transformers import AutoTokenizer, AutoModel, AutoFeatureExtractor #importi
 from PIL import Image
 from tqdm import tqdm
 from torchvision import transforms
+from transformers import get_linear_schedule_with_warmup
 import requests
+from torch.optim import AdamW
 
 class VQADatasetToEmbeddings(Dataset):
 
@@ -43,14 +50,14 @@ class VQADatasetToEmbeddings(Dataset):
 
     def __getitem__(self, idx): #this method fetches a record from the VQA dataset and converts each of the raw multimodal (text and image) data into vector embeddings using the respective feature extractors (backbones), to train the VLP fusion network
         encodings = {}
-
         #Converting textual data into vector embeddings using the L backbone
+        question = self.df['question'][idx]
         text_inputs = self.tokenizer(question, return_tensors="pt") # string -> tokens -> { tensor(int ID values), tensor(attention masks)}
         #print(text_inputs)
         text_inputs = {k:v.to(device) for k,v in text_inputs.items()} #Moving these tensors to the GPU/CPU so they can be fed into BERT.
         #text_outputs = self.text_encoder(**text_inputs)
         text_outputs = self.text_encoder(
-                          input_ids=text_inputs['input_ids'], 
+                          input_ids=text_inputs['input_ids'],
                           attention_mask=text_inputs['attention_mask']
                       )
         text_embedding = text_outputs.pooler_output #Can also experiment with raw CLS embedding below
@@ -60,18 +67,19 @@ class VQADatasetToEmbeddings(Dataset):
         # print("Text emb", text_embedding.shape)
 
         img_file = self.df["image_path"][idx]
-        question = self.df['question'][idx]
         img = Image.open(img_file).convert("RGB") #fetches and loads image from local disk located at that path
         label = self.df['label'][idx]
 
         # Converting image data into vector embeddings using the V backbone (in modern VLP models)
-        img_inputs = self.img_processor(img, return_tensors="pt")
+        img_inputs = self.img_preprocessor(img, return_tensors="pt")
         img_inputs = {k:v.to(device) for k,v in img_inputs.items()}
-        #img_outputs = self.img_encoder(**img_inputs)
+        img_outputs = self.img_encoder(**img_inputs)
+        '''
         img_outputs = self.img_encoder(
-                          input_ids=img_inputs['input_ids'], 
+                          input_ids=img_inputs['input_ids'],
                           attention_mask=img_inputs['attention_mask']
-                      )   
+                      )
+        '''
         img_embedding = img_outputs.pooler_output
         img_embedding = img_embedding.view(-1)
         img_embedding = img_embedding.detach()
@@ -95,11 +103,11 @@ class VQADatasetToEmbeddings(Dataset):
 class EarlyFusionNetwork(nn.Module):
 
     def __init__(self, hyperparms=None):
-        super(EarlyFusionNetwork, self).__init__()        
+        super(EarlyFusionNetwork, self).__init__()
         self.dropout = nn.Dropout(0.3) #30% of neurons randomly turned off during training for regularization
         self.vision_projection = nn.Linear(2048, 768) #fully connected layer that linearly projects the output tensor from the V backbone of size 2048 (for ViT) into tensor of size 768 as output from this layer)
         self.text_projection = nn.Linear(512, 768) #fully connected layer that linearly projects the output tensor from the L backbone of size 512 (for BERT) into tensor of size 768 as output from this layer)
-        self.fully_connected_layer1 = nn.Linear(768, 256) 
+        self.fully_connected_layer1 = nn.Linear(768, 256)
         self.batch_normalization_layer1 = nn.BatchNorm1d(256)
         self.classifier = nn.Linear(256, 13)
 
@@ -110,12 +118,12 @@ class EarlyFusionNetwork(nn.Module):
 
         # initialize weight matrices using He/Kaiming to prevent gradients from vanishing during training
         nn.init.kaiming_uniform_(self.W, a=math.sqrt(5))
-        
-    def forward(self, image_embedding, text_embedding):
-        x1 = image_embedding   
+
+    def forward(self, img_embedding, text_embedding):
+        x1 = img_embedding
         x1 = torch.nn.functional.normalize(x1, p=2, dim=1)
         Xv = self.relu_f(self.vision_projection(x1))
-        
+
         x2 = text_embedding
         x2 = torch.nn.functional.normalize(x2, p=2, dim=1)
         Xt = self.relu_f(self.text_projection(x2))
@@ -133,11 +141,11 @@ class EarlyFusionNetwork(nn.Module):
 class MidFusionNetwork(nn.Module):
 
     def __init__(self, hyperparms=None):
-        super(MidFusionNetwork, self).__init__()        
+        super(MidFusionNetwork, self).__init__()
         self.dropout = nn.Dropout(0.3)
-        self.fully_connected_layer1 = nn.Linear(768, 256) 
+        self.fully_connected_layer1 = nn.Linear(768, 256)
         self.batch_normalization_layer1 = nn.BatchNorm1d(256)
-        self.classifier = nn.Linear(256, 13) 
+        self.classifier = nn.Linear(256, 13)
 
         W = torch.Tensor(768, 768)
         self.W = nn.Parameter(W)
@@ -146,17 +154,17 @@ class MidFusionNetwork(nn.Module):
 
         # initialize weight matrices uisng He/Kaiming init
         nn.init.kaiming_uniform_(self.W, a=math.sqrt(5))
-        
-    def forward(self, image_emb, text_emb):
-        x1 = image_embedding   
+
+    def forward(self, img_embedding, text_embedding):
+        x1 = img_embedding
         Xv = torch.nn.functional.normalize(x1, p=2, dim=1)
-        
+
         x2 = text_embedding
         Xt = torch.nn.functional.normalize(x2, p=2, dim=1)
 
         Xvt = Xv * Xt #fusion step
         Xvt = self.relu_f(torch.mm(Xvt, self.W.t()))
-        
+
         Xvt = self.fully_connected_layer1(Xvt)
         Xvt = self.batch_normalization_layer1(Xvt)
         Xvt = self.dropout(Xvt)
@@ -166,9 +174,13 @@ class MidFusionNetwork(nn.Module):
 
 def create_pd_dataframe(qs, ans, img_ids, type="train"): #function to convert EasyVQA dataset into a pandas dataframe.
     records = []
+    easy_vqa_path = "/content/drive/MyDrive/easy-VQA/easy_vqa/data"
     for q, a, img_id in zip(qs, ans, img_ids):
-        img_path = f"/usr/local/lib/python3.7/dist-packages/easy_vqa/data/{type}/images/{img_id}.png"
-        records.append({"question" : q, "answer": a, "image_path": img_path})
+        if os.path.exists(easy_vqa_path):
+          #img_path = f"/usr/local/lib/python3.7/dist-packages/easy_vqa/data/{type}/images/{img_id}.png"
+          img_path = f"/content/drive/MyDrive/easy-VQA/easy_vqa/data/{type}/images/{img_id}.png"
+          
+          records.append({"question" : q, "answer": a, "image_path": img_path})
     df = pd.DataFrame(records)
     return df
 
@@ -177,26 +189,27 @@ def get_accuracy_score(preds, labels):
 
 def evaluate(val_dataloader):
     model.eval()
-    
+
     loss_val_total = 0
     predictions = []
-    true_vals = [] 
+    true_vals = []
     conf = []
-    
-    for batch in val_dataloader: #batch = {}
-        
-        batch = tuple(b.to(device) for b in batch.values()) #moving the batch of data to the GPU/CPU to feed the VLP fusion model
-        
-        inputs = {'image_embedding':batch[0], 'text_embedding':batch[1]}  
 
-        with torch.no_grad():        
-            #outputs = model(**inputs)
+    for batch in val_dataloader: #batch = {}
+
+        batch = tuple(b.to(device) for b in batch.values()) #moving the batch of data to the GPU/CPU to feed the VLP fusion model
+
+        inputs = {'img_embedding':batch[0], 'text_embedding':batch[1]}
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+            '''
             outputs = model(
-                        image_embedding=batch[0],
+                        img_embedding=batch[0],
                         text_embedding=batch[1]
-                      ) 
-            
-        labels = batch[2]  
+                      )
+            '''
+        labels = batch[2]
         loss = criterion(outputs.view(-1, 13), labels.view(-1))
         loss_val_total += loss.item()
 
@@ -207,12 +220,12 @@ def evaluate(val_dataloader):
         predictions.append(logits)
         true_vals.append(label_ids)
         conf.append(probs)
-    
+
     loss_val_avg = loss_val_total/len(dataloader_val)
     predictions = np.concatenate(predictions, axis=0)
     true_vals = np.concatenate(true_vals, axis=0)
     conf = np.concatenate(confidence, axis=0)
-            
+
     return loss_val_avg, predictions, true_vals, conf
 
 def train():
@@ -235,21 +248,27 @@ def train():
         loss_train_total = 0
         train_predictions, train_true_vals = [], []
 
-        progress_bar = tqdm(dataloader_train, desc='Epoch {:1d}'.format(epoch), leave=False, disable=False)
+        progress_bar = tqdm(train_dataloader, desc='Epoch {:1d}'.format(epoch), leave=False, disable=False)
 
         for batch in progress_bar:
             model.zero_grad()
             batch = tuple(b.to(device) for b in batch.values())
 
-            inputs = {'image_emb':  batch[0],'text_emb': batch[1]} 
+            inputs = {'img_embedding':  batch[0],'text_embedding': batch[1]}
             labels =  batch[2]
 
             outputs = model(**inputs)
+            '''
+            outputs = model(
+                        img_embedding=batch[0],
+                        text_embedding=batch[1]
+                      )
+            '''
             loss = criterion(outputs.view(-1, 13), labels.view(-1))
             loss_train_total += loss.item()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            
+
             logits = outputs.argmax(-1)
             logits = logits.detach().cpu().numpy()
             label_ids = labels.cpu().numpy()
@@ -258,28 +277,26 @@ def train():
 
             optimizer.step()
             scheduler.step()
-            
+
             progress_bar.set_postfix({'training_loss': '{:.3f}'.format(loss.item()/len(batch))})
-            
-            
-        
+
         train_predictions = np.concatenate(train_predictions, axis=0)
         train_true_vals = np.concatenate(train_true_vals, axis=0)
 
         tqdm.write(f'\nEpoch {epoch}')
-        loss_train_avg = loss_train_total/len(dataloader_train)            
+        loss_train_avg = loss_train_total/len(dataloader_train)
         tqdm.write(f'Training loss: {loss_train_avg}')
-        train_f1 = accuracy_score_func(train_predictions, train_true_vals)
+        train_f1 = get_accuracy_score(train_predictions, train_true_vals)
         tqdm.write(f'Train Acc: {train_f1}')
-        
+
         val_loss, predictions, true_vals,_ = evaluate(dataloader_validation)
-        val_f1 = accuracy_score_func(predictions, true_vals)
+        val_f1 = get_accuracy_score(predictions, true_vals)
         tqdm.write(f'Validation loss: {val_loss}')
         tqdm.write(f'Val Acc: {val_f1}')
 
         if val_f1 >= max_auc_score:
             tqdm.write('\nSaving best model')
-            torch.save(model.state_dict(), f'/content/models/easyvqa_finetuned_epoch_{epoch}.model')          
+            torch.save(model.state_dict(), f'/content/models/easyvqa_finetuned_epoch_{epoch}.model')
             max_auc_score = val_f1
 
         train_losses.append(loss_train_avg)
@@ -300,7 +317,7 @@ def train():
                   early_stop = True
                   break
               else:
-                  continue    
+                  continue
 
 
     if early_stop:
@@ -330,7 +347,7 @@ if __name__ == "__main__":
   ans_to_labels = {a : i for i, a in enumerate(ans)} # dictionary of unique labels (answers) mapping to integer indexes
   #print(label_to_idx)
 
-  # inserting new column "label" containing the corresponding integer indices for the answer strings to each dataframe 
+  # inserting new column "label" containing the corresponding integer indices for the answer strings to each dataframe
   train_df["label"] = train_df["answer"].apply(lambda a: ans_to_labels.get(a))
   val_df["label"] = val_df["answer"].apply(lambda a: ans_to_labels.get(a))
   test_df["label"] = test_df["answer"].apply(lambda a: ans_to_labels.get(a))
@@ -395,5 +412,64 @@ if __name__ == "__main__":
                             sampler=SequentialSampler(val_dataset),
                             batch_size=eval_batch_size
                         )
-  
+
   criterion = nn.CrossEntropyLoss() #using cross entropy loss since this is a classification problem
+
+  torch.cuda.empty_cache()
+  model = EarlyFusionNetwork()
+  model.to(device)
+
+  model = MidFusionNetwork()
+  model.to(device)
+
+  optimizer = AdamW(model.parameters(),
+                  lr=5e-5,
+                  weight_decay = 1e-5,
+                  eps=1e-8
+                  )
+
+  epochs = 10
+  train_steps=20000
+  print("train_steps", train_steps)
+  warm_steps = train_steps * 0.1
+  print("warm_steps", warm_steps)
+  scheduler = get_linear_schedule_with_warmup(optimizer,
+                                              num_warmup_steps=warm_steps,
+                                              num_training_steps=train_steps)
+  try:
+    !rm -rf /content/models
+    !mkdir /content/models
+    train_losses, val_losses =  train()
+    torch.cuda.empty_cache()
+    plt.plot(train_losses)
+    plt.plot(val_losses)
+    plt.title('model loss')
+    plt.ylabel('loss')
+    plt.xlabel('epoch')
+    plt.legend(['train', 'val'], loc='upper left')
+    plt.show()
+  except Exception as e:
+    print(f"Training loop interrupted! Due to an error: {e}")
+
+  test_dataset = VQADatasetToEmbeddings(
+                    df=test_df,
+                    tokenizer=tokenize_text_preprocessor,
+                    img_preprocessor=img_preprocessor,
+                    text_encoder=text_encoder_bert,
+                    img_encoder=img_encoder_vit
+                )
+
+  device = "cuda:0"
+  model.load_state_dict(torch.load('/content/models/easyvqa_finetuned_epoch_9.model'))
+  model.to(device)
+
+  dataloader_test = DataLoader(
+                        test_dataset,
+                        sampler=SequentialSampler(test_dataset),
+                        batch_size=128
+                    )
+
+_, preds, truths, confidence = evaluate(dataloader_test)
+
+print("Test Acc with ViT: " , get_accuracy_score(preds,truths))
+test_results_df = pd.concat([test_df, pd.DataFrame(preds, columns=["preds"]), pd.DataFrame(truths, columns=["gt"]), pd.DataFrame(confidence, columns=["confidence"])], axis=1)
