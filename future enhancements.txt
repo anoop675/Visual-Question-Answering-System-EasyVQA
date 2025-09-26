@@ -1,0 +1,38 @@
+* Fix reproducibility & hygiene
+  Replace hard-coded Drive paths with a DATA_ROOT config / CLI flags.
+  Create requirements.txt and a run.sh / train.py entrypoint.
+  Add a small sample dataset & seed values so others can run quickly.
+
+* Cache the backbone embeddings
+  Extract and store (image_id → npz) ViT and (question_id → npz) BERT embeddings once. This speeds experiments enormously and reduces GPU cost.
+
+* Add a --regen-embeddings flag.
+  Swap simple fusion for cross-modal attention (largest model quality win)
+  Replace elementwise product + bilinear W with a lightweight cross-attention block (queries from text, keys/values from image or vice versa).
+  Adopt single Transformer layer as the fusion head (which often outperforms multiplicative fusion for VQA.)
+
+* Fine-tune backbones selectively
+  Try three modes: 
+      frozen backbones (baseline)
+      fine-tune last transformer block(s)
+      full fine-tune 
+  Compare validation curves.
+  Use layer-wise LR decay (smaller LR for backbone).
+  
+* Try modern multimodal backbones and contrastive pretraining
+  Evaluate CLIP-style encoders (contrastive) and BLIP / OFA / ViLT / LXMERT style models that are pretrained for image-text tasks. Even using these as frozen encoders often helps.
+
+* Move from classification to generative/open-vocab
+  Replace discrete-answer classification with a decoder (e.g., BART/T5 head) to allow open-ended answers (useful for real dialogue systems).
+  Stronger evaluation & ablations
+  Per-question-type accuracy, top-k accuracy, confidence calibration (ECE), confusion matrix, qualitative examples.
+  Ablate: fusion type, projection sizes, frozen vs fine-tune, optimizer settings.
+
+* Add explainability & visualizations
+  Attention heatmaps, Grad-CAM on ViT patches, or overlay predicted token attention on the image. Great for demos and interviews.
+
+* Robustness & augmentation
+  Image augmentations, text paraphrases, adversarial text/image perturbations, and test-time augmentation.
+
+* Scale & serve
+  Convert model to TorchScript / ONNX, or create a Gradio demo. Host on Hugging Face Spaces or a small Docker container with API + demo UI.
