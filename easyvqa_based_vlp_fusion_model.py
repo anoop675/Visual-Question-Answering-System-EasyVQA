@@ -11,8 +11,8 @@ They are a foundational step in multimodal AI, designed to understand and relate
 !pip install -qqq easy-vqa
 !pip install -qqq sentence_transformers transformers timm
 
-from google.colab import drive
-drive.mount('/content/drive', force_remount=True)
+#from google.colab import drive
+#drive.mount('/content/drive', force_remount=True)
 
 import os
 import math
@@ -35,6 +35,8 @@ from torchvision import transforms
 from transformers import get_linear_schedule_with_warmup
 import requests
 from torch.optim import AdamW
+from zipfile import ZipFile
+import traceback
 
 class VQADatasetToEmbeddings(Dataset):
 
@@ -54,6 +56,8 @@ class VQADatasetToEmbeddings(Dataset):
         question = self.df['question'][idx]
         text_inputs = self.tokenizer(question, return_tensors="pt") # string -> tokens -> { tensor(int ID values), tensor(attention masks)}
         #print(text_inputs)
+        # Assuming 'device' is defined globally in __main__
+        global device
         text_inputs = {k:v.to(device) for k,v in text_inputs.items()} #Moving these tensors to the GPU/CPU so they can be fed into BERT.
         #text_outputs = self.text_encoder(**text_inputs)
         text_outputs = self.text_encoder(
@@ -105,8 +109,9 @@ class EarlyFusionNetwork(nn.Module):
     def __init__(self, hyperparms=None):
         super(EarlyFusionNetwork, self).__init__()
         self.dropout = nn.Dropout(0.3) #30% of neurons randomly turned off during training for regularization
-        self.vision_projection = nn.Linear(2048, 768) #fully connected layer that linearly projects the output tensor from the V backbone of size 2048 (for ViT) into tensor of size 768 as output from this layer)
-        self.text_projection = nn.Linear(512, 768) #fully connected layer that linearly projects the output tensor from the L backbone of size 512 (for BERT) into tensor of size 768 as output from this layer)
+        # ViT-base and BERT-base pooler_output size is 768.
+        self.vision_projection = nn.Linear(768, 768) #fully connected layer that linearly projects the output tensor from the V backbone of size 768 (for ViT) into tensor of size 768 as output from this layer)
+        self.text_projection = nn.Linear(768, 768) #fully connected layer that linearly projects the output tensor from the L backbone of size 768 (for BERT) into tensor of size 768 as output from this layer)
         self.fully_connected_layer1 = nn.Linear(768, 256)
         self.batch_normalization_layer1 = nn.BatchNorm1d(256)
         self.classifier = nn.Linear(256, 13)
@@ -174,12 +179,18 @@ class MidFusionNetwork(nn.Module):
 
 def create_pd_dataframe(qs, ans, img_ids, type="train"): #function to convert EasyVQA dataset into a pandas dataframe.
     records = []
-    easy_vqa_path = "/content/drive/MyDrive/easy-VQA/easy_vqa/data"
+    #easy_vqa_path = "/content/drive/MyDrive/easy-VQA/easy_vqa/data"
+    easy_vqa_zip_path = "easy-VQA.zip"
+    dest_path = "easy-VQA"
+    with ZipFile(easy_vqa_zip_path) as zf:
+      zf.extractall(dest_path)
+
     for q, a, img_id in zip(qs, ans, img_ids):
-        if os.path.exists(easy_vqa_path):
+        if os.path.exists(dest_path):
           #img_path = f"/usr/local/lib/python3.7/dist-packages/easy_vqa/data/{type}/images/{img_id}.png"
-          img_path = f"/content/drive/MyDrive/easy-VQA/easy_vqa/data/{type}/images/{img_id}.png"
-          
+          #img_path = f"/content/drive/MyDrive/easy-VQA/easy_vqa/data/{type}/images/{img_id}.png"
+          img_path = f"easy-VQA/easy-VQA/easy_vqa/data/{type}/images/{img_id}.png" 
+
           records.append({"question" : q, "answer": a, "image_path": img_path})
     df = pd.DataFrame(records)
     return df
@@ -187,53 +198,12 @@ def create_pd_dataframe(qs, ans, img_ids, type="train"): #function to convert Ea
 def get_accuracy_score(preds, labels):
     return accuracy_score(labels, preds)
 
-def evaluate(val_dataloader):
-    model.eval()
-
-    loss_val_total = 0
-    predictions = []
-    true_vals = []
-    conf = []
-
-    for batch in val_dataloader: #batch = {}
-
-        batch = tuple(b.to(device) for b in batch.values()) #moving the batch of data to the GPU/CPU to feed the VLP fusion model
-
-        inputs = {'img_embedding':batch[0], 'text_embedding':batch[1]}
-
-        with torch.no_grad():
-            outputs = model(**inputs)
-            '''
-            outputs = model(
-                        img_embedding=batch[0],
-                        text_embedding=batch[1]
-                      )
-            '''
-        labels = batch[2]
-        loss = criterion(outputs.view(-1, 13), labels.view(-1))
-        loss_val_total += loss.item()
-
-        probs = torch.max(outputs.softmax(dim=1), dim=-1)[0].detach().cpu().numpy()
-        outputs = outputs.argmax(-1)
-        logits = outputs.detach().cpu().numpy()
-        label_ids = labels.cpu().numpy()
-        predictions.append(logits)
-        true_vals.append(label_ids)
-        conf.append(probs)
-
-    loss_val_avg = loss_val_total/len(dataloader_val)
-    predictions = np.concatenate(predictions, axis=0)
-    true_vals = np.concatenate(true_vals, axis=0)
-    conf = np.concatenate(confidence, axis=0)
-
-    return loss_val_avg, predictions, true_vals, conf
-
 def train():
     train_history = open("/content/models/train_history.csv", "w")
-    log_hdr  = "Epoch, train_loss, train_acc, val_loss, val_acc"
-    train_history.write(log_hdr  + "\n")
-    train_f1s = []
-    val_f1s = []
+    log_header  = "Epoch, train_loss, train_acc, val_loss, val_acc"
+    train_history.write(log_header  + "\n")
+    train_f1_scores = []
+    val_f1_scores = []
     train_losses = []
     val_losses = []
     min_val_loss = -1
@@ -242,20 +212,22 @@ def train():
     early_stopping_epoch = 3
     early_stop = False
 
-    for epoch in tqdm(range(1, epochs+1)):
+    global epochs, model, train_dataloader, criterion, optimizer, scheduler, device
 
-        model.train()
-        loss_train_total = 0
+    for epoch in tqdm(range(1, epochs+1)):
+        model.train() #switching model to training mode
+        total_train_loss = 0
         train_predictions, train_true_vals = [], []
 
         progress_bar = tqdm(train_dataloader, desc='Epoch {:1d}'.format(epoch), leave=False, disable=False)
 
         for batch in progress_bar:
-            model.zero_grad()
-            batch = tuple(b.to(device) for b in batch.values())
+            model.zero_grad() #refreshing model's gradients
 
-            inputs = {'img_embedding':  batch[0],'text_embedding': batch[1]}
-            labels =  batch[2]
+            batch = {k: v.to(device) for k, v in batch.items()} #Unpacking dictionary using keys, then move to device
+
+            inputs = {'img_embedding':  batch['image_embedding'],'text_embedding': batch['text_embedding']}
+            labels =  batch['label']
 
             outputs = model(**inputs)
             '''
@@ -265,7 +237,7 @@ def train():
                       )
             '''
             loss = criterion(outputs.view(-1, 13), labels.view(-1))
-            loss_train_total += loss.item()
+            total_train_loss += loss.item()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
@@ -278,32 +250,32 @@ def train():
             optimizer.step()
             scheduler.step()
 
-            progress_bar.set_postfix({'training_loss': '{:.3f}'.format(loss.item()/len(batch))})
+            progress_bar.set_postfix({'training_loss': '{:.3f}'.format(loss.item() / len(labels))})
 
         train_predictions = np.concatenate(train_predictions, axis=0)
         train_true_vals = np.concatenate(train_true_vals, axis=0)
 
         tqdm.write(f'\nEpoch {epoch}')
-        loss_train_avg = loss_train_total/len(dataloader_train)
-        tqdm.write(f'Training loss: {loss_train_avg}')
-        train_f1 = get_accuracy_score(train_predictions, train_true_vals)
-        tqdm.write(f'Train Acc: {train_f1}')
+        avg_train_loss = total_train_loss / len(train_dataloader)
+        tqdm.write(f'Training loss: {avg_train_loss}')
+        train_f1_score = get_accuracy_score(train_predictions, train_true_vals)
+        tqdm.write(f'Train Acc: {train_f1_score}')
 
-        val_loss, predictions, true_vals,_ = evaluate(dataloader_validation)
-        val_f1 = get_accuracy_score(predictions, true_vals)
+        val_loss, predictions, true_vals, _ = evaluate(val_dataloader) 
+        val_f1_score = get_accuracy_score(predictions, true_vals)
         tqdm.write(f'Validation loss: {val_loss}')
-        tqdm.write(f'Val Acc: {val_f1}')
+        tqdm.write(f'Val Acc: {val_f1_score}')
 
-        if val_f1 >= max_auc_score:
+        if val_f1_score >= max_auc_score:
             tqdm.write('\nSaving best model')
-            torch.save(model.state_dict(), f'/content/models/easyvqa_finetuned_epoch_{epoch}.model')
-            max_auc_score = val_f1
+            torch.save(model.state_dict(), f'/content/models/best_model_fusion.model') #Save the model with the best performance
+            max_auc_score = val_f1_score
 
-        train_losses.append(loss_train_avg)
+        train_losses.append(avg_train_loss)
         val_losses.append(val_loss)
-        train_f1s.append(train_f1)
-        val_f1s.append(val_f1)
-        log_str  = "{}, {}, {}, {}, {}".format(epoch, loss_train_avg, train_f1, val_loss, val_f1)
+        train_f1_scores.append(train_f1_score)
+        val_f1_scores.append(val_f1_score)
+        log_str  = "{}, {}, {}, {}, {}".format(epoch, avg_train_loss, train_f1_score, val_loss, val_f1_score)
         train_history.write(log_str + "\n")
 
         if min_val_loss < 0:
@@ -311,6 +283,7 @@ def train():
         else:
           if val_loss < min_val_loss:
               min_val_loss = val_loss
+              epochs_no_improve = 0 #Resets counter on improvement
           else:
               epochs_no_improve += 1
               if epochs_no_improve >= early_stopping_epoch:
@@ -322,10 +295,53 @@ def train():
 
     if early_stop:
       print("Early Stopping activated at epoch -", epoch )
-      print("Use the checkpoint at epoch - ", epoch - early_stopping_epoch)
+      print("Use the best checkpoint saved at /content/models/best_model_fusion.model")
 
     train_history.close()
     return train_losses, val_losses
+
+def evaluate(val_dataloader):
+    model.eval() #switching model to validation mode
+
+    total_val_loss = 0.0
+    predictions = []
+    true_vals = []
+    conf = []
+
+    global criterion, device
+
+    for batch in val_dataloader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+
+        inputs = {'img_embedding': batch['image_embedding'], 'text_embedding': batch['text_embedding']}
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+            '''
+            outputs = model(
+                        img_embedding=batch[0],
+                        text_embedding=batch[1]
+                      )
+            '''
+        labels = batch['label']
+        loss = criterion(outputs.view(-1, 13), labels.view(-1))
+        total_val_loss += loss.item()
+
+        probs = torch.max(outputs.softmax(dim=1), dim=-1)[0].detach().cpu().numpy()
+        outputs = outputs.argmax(-1)
+        logits = outputs.detach().cpu().numpy()
+        label_ids = labels.cpu().numpy()
+        predictions.append(logits)
+        true_vals.append(label_ids)
+        conf.append(probs)
+
+    loss_val_avg = total_val_loss / len(val_dataloader)
+    predictions = np.concatenate(predictions, axis=0)
+    true_vals = np.concatenate(true_vals, axis=0)
+    conf = np.concatenate(conf, axis=0)
+
+    return loss_val_avg, predictions, true_vals, conf
+
 
 if __name__ == "__main__":
   '''Splitting the VQA dataframe'''
@@ -335,7 +351,7 @@ if __name__ == "__main__":
   ans = get_answers()
 
   temp_df = create_pd_dataframe(train_qs, train_ans, train_img_ids, type="train")
-  temp_df = temp_df.sample(frac=1) # shuffling trainign set
+  temp_df = temp_df.sample(frac=1) # shuffling entire training set
   train_df, val_df = train_test_split(temp_df, test_size=0.25) #75% train & 25% val
   test_df = create_pd_dataframe(test_qs, test_ans, test_img_ids, type="test")
   #print(train_df.shape)
@@ -395,81 +411,105 @@ if __name__ == "__main__":
                       text_encoder=text_encoder_bert,
                       img_encoder = img_encoder_vit
                   )
+  test_dataset = VQADatasetToEmbeddings(
+                      df=test_df,
+                      tokenizer=tokenize_text_preprocessor,
+                      img_preprocessor=img_preprocessor,
+                      text_encoder=text_encoder_bert,
+                      img_encoder=img_encoder_vit
+                  )
 
-  print(train_dataset)
-
-  batch_size = 32
-  eval_batch_size = 32
+  train_batch_size = 32
+  val_batch_size = 32
 
   train_dataloader = DataLoader(
                         train_dataset,
                         sampler=RandomSampler(train_dataset),
-                        batch_size=batch_size
+                        batch_size=train_batch_size
                     )
 
   val_dataloader = DataLoader(
                             val_dataset,
                             sampler=SequentialSampler(val_dataset),
-                            batch_size=eval_batch_size
+                            batch_size=val_batch_size
                         )
 
-  criterion = nn.CrossEntropyLoss() #using cross entropy loss since this is a classification problem
-
-  torch.cuda.empty_cache()
-  model = EarlyFusionNetwork()
-  model.to(device)
-
-  model = MidFusionNetwork()
-  model.to(device)
-
-  optimizer = AdamW(model.parameters(),
-                  lr=5e-5,
-                  weight_decay = 1e-5,
-                  eps=1e-8
-                  )
-
-  epochs = 10
-  train_steps=20000
-  print("train_steps", train_steps)
-  warm_steps = train_steps * 0.1
-  print("warm_steps", warm_steps)
-  scheduler = get_linear_schedule_with_warmup(optimizer,
-                                              num_warmup_steps=warm_steps,
-                                              num_training_steps=train_steps)
+  '''Defining the training loop for our early fusion and mid fusion networks'''
   try:
+    criterion = nn.CrossEntropyLoss() #using cross entropy loss since this is a classification problem
+
+    epochs = 10
+    train_steps = len(train_dataloader) * epochs
+    #print("train_steps", train_steps)
+    warm_steps = train_steps * 0.1
+    #print("warm_steps", warm_steps)
+
+    torch.cuda.empty_cache()
+
+    #Training the Early Fusion network:
+    print("\n--- Training Early Fusion Network ---")
+    model = EarlyFusionNetwork()
+    model.to(device)
+
+    optimizer = AdamW(model.parameters(), lr=5e-5, weight_decay = 1e-5, eps=1e-8)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warm_steps, num_training_steps=train_steps)
+
     !rm -rf /content/models
     !mkdir /content/models
     train_losses, val_losses =  train()
     torch.cuda.empty_cache()
+
     plt.plot(train_losses)
     plt.plot(val_losses)
-    plt.title('model loss')
-    plt.ylabel('loss')
-    plt.xlabel('epoch')
-    plt.legend(['train', 'val'], loc='upper left')
+    plt.title('Early Fusion Model Loss')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend(['train', 'validation'], loc='upper left')
     plt.show()
+
+    #Training the mid fusion network
+    print("\n--- Training Mid Fusion Network ---")
+    model = MidFusionNetwork()
+    model.to(device)
+
+    optimizer = AdamW(model.parameters(), lr=5e-5, weight_decay = 1e-5, eps=1e-8)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warm_steps, num_training_steps=train_steps)
+
+    # !rm -rf /content/models     # Re-initialize models directory for new model training if needed, though unnecessary here as best_model_fusion.model is used as the best checkpoint
+    # !mkdir /content/models
+    train_losses, val_losses = train()
+    torch.cuda.empty_cache()
+
+    plt.plot(train_losses)
+    plt.plot(val_losses)
+    plt.title('Mid Fusion Model Loss')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend(['train', 'validation'], loc='upper left')
+    plt.show()
+
+    # Testing the last trained model (Mid Fusion) with the best checkpoint saved
+    print("\n--- Testing Mid Fusion Network ---")
+    device = "cuda:0"
+
+    model.load_state_dict(torch.load('/content/models/best_model_fusion.model')) # Load the best saved model from the last training run (Mid Fusion)
+    model.to(device)
+
+    dataloader_test = DataLoader(
+                          test_dataset,
+                          sampler=SequentialSampler(test_dataset),
+                          batch_size=128
+                      )
+
+    _, preds, truths, confidence = evaluate(dataloader_test)
+
+    print("Test Accuracy with ViT: " , get_accuracy_score(preds,truths))
+    test_results_df = pd.concat([
+                        test_df,
+                        pd.DataFrame(preds, columns=["preds"]),
+                        pd.DataFrame(truths, columns=["gt"]),
+                        pd.DataFrame(confidence, columns=["confidence"]
+                    )], axis=1)
   except Exception as e:
-    print(f"Training loop interrupted! Due to an error: {e}")
-
-  test_dataset = VQADatasetToEmbeddings(
-                    df=test_df,
-                    tokenizer=tokenize_text_preprocessor,
-                    img_preprocessor=img_preprocessor,
-                    text_encoder=text_encoder_bert,
-                    img_encoder=img_encoder_vit
-                )
-
-  device = "cuda:0"
-  model.load_state_dict(torch.load('/content/models/easyvqa_finetuned_epoch_9.model'))
-  model.to(device)
-
-  dataloader_test = DataLoader(
-                        test_dataset,
-                        sampler=SequentialSampler(test_dataset),
-                        batch_size=128
-                    )
-
-_, preds, truths, confidence = evaluate(dataloader_test)
-
-print("Test Acc with ViT: " , get_accuracy_score(preds,truths))
-test_results_df = pd.concat([test_df, pd.DataFrame(preds, columns=["preds"]), pd.DataFrame(truths, columns=["gt"]), pd.DataFrame(confidence, columns=["confidence"])], axis=1)
+    print(f"\nError: {e}")
+    print(traceback.format_exc())
