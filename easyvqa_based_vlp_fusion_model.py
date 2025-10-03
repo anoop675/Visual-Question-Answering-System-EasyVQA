@@ -38,6 +38,54 @@ from torch.optim import AdamW
 from zipfile import ZipFile
 import traceback
 
+# Put this in your notebook/script and run once before training
+import torch
+from PIL import Image
+from tqdm import tqdm
+
+#batch computing multimodal embeddings before fusion model training
+def build_and_save_embeddings(df, tokenizer, img_preprocessor, text_encoder, img_encoder, out_path, device="cuda:0", batch_size=64):
+    text_encoder.eval()
+    img_encoder.eval()
+    text_encoder.to(device)
+    img_encoder.to(device)
+    text_embeddings, img_embeddings, labels = [], [], []
+
+    for i in tqdm(range(0, len(df), batch_size), desc=f"Building {out_path}"):
+        batch = df.iloc[i:i+batch_size] #slicing batch
+        qs = batch["question"].tolist()
+        imgs = [Image.open(this_path).convert("RGB") for this_path in batch["image_path"].tolist()]
+
+        with torch.no_grad():
+            tokenized_qs = tokenizer(qs, padding=True, truncation=True, return_tensors="pt")
+            tokenized_qs.to(device)
+            text_output = text_encoder(**tokenized_qs).pooler_output.cpu() # (64, 768)
+
+            img_inputs = img_preprocessor(images=imgs, return_tensors="pt")
+            img_inputs.to(device)
+            img_output = img_encoder(**img_inputs).pooler_output.cpu()# (64, 768)
+
+        text_embeddings.append(text_output)
+        img_embeddings.append(img_output)
+        labels.append(torch.tensor(batch["label"].values, dtype=torch.long))
+
+    text_emb = torch.cat(text_embeddings, dim=0)
+    img_emb = torch.cat(img_embeddings, dim=0)
+    labels = torch.cat(labels, dim=0)
+    torch.save({"text": text_emb, "img": img_emb, "labels": labels}, out_path)
+    print("Saved:", out_path)
+
+class EmbeddingDataset(torch.utils.data.Dataset):
+    def __init__(self, path):
+        d = torch.load(path)
+        self.text = d["text"]   # (N, 768)
+        self.img  = d["img"]    # (N, 768)
+        self.labels = d["labels"]
+    def __len__(self): return len(self.labels)
+    def __getitem__(self, idx):
+        return {"text_embedding": self.text[idx], "image_embedding": self.img[idx], "label": self.labels[idx]}
+
+"""
 class VQADatasetToEmbeddings(Dataset):
 
     def __init__(self, df, tokenizer, img_preprocessor, text_encoder, img_encoder):
@@ -59,6 +107,7 @@ class VQADatasetToEmbeddings(Dataset):
         # Assuming 'device' is defined globally in __main__
         global device
         text_inputs = {k:v.to(device) for k,v in text_inputs.items()} #Moving these tensors to the GPU/CPU so they can be fed into BERT.
+        #print(text_inputs.items())
         #text_outputs = self.text_encoder(**text_inputs)
         text_outputs = self.text_encoder(
                           input_ids=text_inputs['input_ids'],
@@ -103,6 +152,7 @@ class VQADatasetToEmbeddings(Dataset):
         encodings["label"] = torch.tensor(label)
 
         return encodings
+"""
 
 class EarlyFusionNetwork(nn.Module):
 
@@ -189,7 +239,7 @@ def create_pd_dataframe(qs, ans, img_ids, type="train"): #function to convert Ea
         if os.path.exists(dest_path):
           #img_path = f"/usr/local/lib/python3.7/dist-packages/easy_vqa/data/{type}/images/{img_id}.png"
           #img_path = f"/content/drive/MyDrive/easy-VQA/easy_vqa/data/{type}/images/{img_id}.png"
-          img_path = f"easy-VQA/easy-VQA/easy_vqa/data/{type}/images/{img_id}.png" 
+          img_path = f"easy-VQA/easy-VQA/easy_vqa/data/{type}/images/{img_id}.png"
 
           records.append({"question" : q, "answer": a, "image_path": img_path})
     df = pd.DataFrame(records)
@@ -250,6 +300,8 @@ def train():
             optimizer.step()
             scheduler.step()
 
+            #TODO: Early stopping functionality and make sure that accuracy above 50p
+
             progress_bar.set_postfix({'training_loss': '{:.3f}'.format(loss.item() / len(labels))})
 
         train_predictions = np.concatenate(train_predictions, axis=0)
@@ -261,7 +313,7 @@ def train():
         train_f1_score = get_accuracy_score(train_predictions, train_true_vals)
         tqdm.write(f'Train Acc: {train_f1_score}')
 
-        val_loss, predictions, true_vals, _ = evaluate(val_dataloader) 
+        val_loss, predictions, true_vals, _ = evaluate(val_dataloader)
         val_f1_score = get_accuracy_score(predictions, true_vals)
         tqdm.write(f'Validation loss: {val_loss}')
         tqdm.write(f'Val Acc: {val_f1_score}')
@@ -344,6 +396,7 @@ def evaluate(val_dataloader):
 
 
 if __name__ == "__main__":
+
   '''Splitting the VQA dataframe'''
   # Getting textual questions and corresponding answers from Easy VQA dataset
   train_qs, train_ans, train_img_ids = get_train_questions()
@@ -388,11 +441,16 @@ if __name__ == "__main__":
   for p in img_encoder_vit.parameters(): #We are leaving the parameters (tensors) of the ViT model unchanged (frozen) (to avoid re-training it when the entire fusion network learns)
       p.requires_grad = False
 
-  text_encoder_bert.to(device)
-  img_encoder_vit.to(device)
-  #print()
+  if not os.path.exists("train_embeddings.pt"):
+    build_and_save_embeddings(train_df, tokenize_text_preprocessor, img_preprocessor, text_encoder_bert, img_encoder_vit, "train_embeddings.pt", device=device)
 
-  '''Creating train and validation sets for training the VLP fusion model after converting raw V + L data into respective feature vectors (embeddings) from the backbones'''
+  if not os.path.exists("val_embeddings.pt"):
+    build_and_save_embeddings(val_df,   tokenize_text_preprocessor, img_preprocessor, text_encoder_bert, img_encoder_vit, "val_embeddings.pt", device=device)
+
+  if not os.path.exists("test_embeddings.pt"):
+    build_and_save_embeddings(test_df,  tokenize_text_preprocessor, img_preprocessor, text_encoder_bert, img_encoder_vit, "test_embeddings.pt", device=device)
+
+  '''Creating train and validation sets for training the VLP fusion model after converting raw V + L data into respective feature vectors (embeddings) from the backbones
   train_df.reset_index(drop=True, inplace=True)
   val_df.reset_index(drop=True, inplace=True)
 
@@ -432,7 +490,26 @@ if __name__ == "__main__":
                             val_dataset,
                             sampler=SequentialSampler(val_dataset),
                             batch_size=val_batch_size
-                        )
+                        )'''
+
+  train_dataset = EmbeddingDataset("train_embeddings.pt")
+  val_dataset   = EmbeddingDataset("val_embeddings.pt")
+
+  train_dataloader = DataLoader(
+                        train_dataset,
+                        batch_size=32,
+                        shuffle=True,
+                        num_workers=4,
+                        pin_memory=True
+                    )
+
+  val_dataloader   = DataLoader(
+                        val_dataset,
+                        batch_size=32,
+                        shuffle=False,
+                        num_workers=4,
+                        pin_memory=True
+                    )
 
   '''Defining the training loop for our early fusion and mid fusion networks'''
   try:
@@ -444,7 +521,7 @@ if __name__ == "__main__":
     warm_steps = train_steps * 0.1
     #print("warm_steps", warm_steps)
 
-    torch.cuda.empty_cache()
+    torch.cuda.empty_cache() #refreshing the GPU cache
 
     #Training the Early Fusion network:
     print("\n--- Training Early Fusion Network ---")
@@ -487,12 +564,12 @@ if __name__ == "__main__":
     plt.xlabel('Epoch')
     plt.legend(['train', 'validation'], loc='upper left')
     plt.show()
-
+  
     # Testing the last trained model (Mid Fusion) with the best checkpoint saved
     print("\n--- Testing Mid Fusion Network ---")
     device = "cuda:0"
 
-    model.load_state_dict(torch.load('/content/models/best_model_fusion.model')) # Load the best saved model from the last training run (Mid Fusion)
+    model.load_state_dict(torch.load('/content/models/best_model_fusion.model'), map_location=device) # Load the best saved model from the last training run (Mid Fusion)
     model.to(device)
 
     dataloader_test = DataLoader(
