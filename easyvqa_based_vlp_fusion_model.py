@@ -299,9 +299,7 @@ def train():
 
             optimizer.step()
             scheduler.step()
-
-            #TODO: Early stopping functionality and make sure that accuracy above 50p
-
+            
             progress_bar.set_postfix({'training_loss': '{:.3f}'.format(loss.item() / len(labels))})
 
         train_predictions = np.concatenate(train_predictions, axis=0)
